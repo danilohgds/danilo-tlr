@@ -91,3 +91,77 @@ CREATE TABLE events_raw (
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (user_id, ts);
+
+
+Aggregation Per Minute
+CREATE TABLE user_minutely (
+  bucket_start DateTime('UTC'),
+  user_id String,
+  cnt AggregateFunction(sum, UInt32)
+) ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(bucket_start)
+ORDER BY (bucket_start, user_id);
+
+CREATE MATERIALIZED VIEW mv_user_minutely
+TO user_minutely AS
+SELECT
+  toStartOfMinute(ts) AS bucket_start,
+  user_id,
+  sumState(toUInt32(1)) AS cnt
+FROM events_raw
+GROUP BY bucket_start, user_id;
+
+Top-N Query
+SELECT
+  user_id,
+  sumMerge(cnt) AS total_events
+FROM user_minutely
+WHERE bucket_start >= now() - INTERVAL 24 HOUR
+GROUP BY user_id
+ORDER BY total_events DESC
+LIMIT 100;
+
+API Sample
+import express from 'express';
+
+const app = express();
+const PORT = 3000;
+
+let clickhouseClient: any; // Assume this is initialized elsewhere
+
+async function queryTopUsers(windowHours = 24, limit = 100) {
+  const sql = `
+    SELECT user_id, COUNT(*) AS total_events
+    FROM events_raw
+    WHERE ts >= NOW() - INTERVAL '${windowHours} HOURS'
+    GROUP BY user_id
+    ORDER BY total_events DESC
+    LIMIT ${limit};
+  `;
+  return clickhouseClient.query(sql);
+}
+
+app.get('/metrics/top-users', async (req, res) => {
+  try {
+    const window = req.query.window || "24h";
+    const limit = parseInt(req.query.limit || "100", 10);
+
+    const windowHours = parseInt(window.replace("h", ""), 10);
+
+    const results = await queryTopUsers(windowHours, limit);
+
+    res.json({
+      window,
+      as_of: new Date().toISOString(),
+      limit,
+      results
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Metrics API running at http://localhost:${PORT}`);
+});
